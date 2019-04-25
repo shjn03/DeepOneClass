@@ -6,9 +6,10 @@ Created on Sun Apr 21 09:43:33 2019
 @author: shingo
 """
 
-from keras.datasets import mnist,cifar10
+from keras.datasets import mnist,cifar10,fashion_mnist,cifar100
 import cv2
 import os
+import numpy as np
 num_classes=10
 datasets=["cifar10"]
 outbasedir="data"
@@ -30,6 +31,10 @@ for dataname in datasets:
                         'horse',
                         'ship',
                         'truck']    
+        y_train=np.squeeze(y_train)
+        y_test=np.squeeze(y_test)
+        
+        
     
     
     os.makedirs(os.path.join(outbasedir,dataname),exist_ok=True)
@@ -38,11 +43,11 @@ for dataname in datasets:
         os.makedirs(os.path.join(outbasedir,dataname,"test",class_name),exist_ok=True)
         
     for idx in range(len(y_train)):
-        class_name=class_names[y_train[idx][0]]
+        class_name=class_names[y_train[idx]]
         img=X_train[idx]
         cv2.imwrite(os.path.join(outbasedir,dataname,"train",str(class_name),class_name+"_"+str(idx)+".png"),img)
     for idx in range(len(y_test)):
-        class_name=class_names[y_test[idx][0]]
+        class_name=class_names[y_test[idx]]
         img=X_test[idx]
         cv2.imwrite(os.path.join(outbasedir,dataname,"test",str(class_name),class_name+"_"+str(idx)+".png"),img)
         

@@ -10,7 +10,7 @@ from keras.datasets import fashion_mnist
 import numpy as np
 from tqdm import tqdm
 from keras.models import Model,load_model
-from keras.layers import Input,Lambda,Dense
+from keras.layers import Input,Lambda,Dense,Dropout,Flatten
 from sklearn.metrics import euclidean_distances, roc_auc_score
 import cv2
 import bhtsne
@@ -19,11 +19,13 @@ import sklearn.base
 import scipy as sp
 import keras
 from sklearn import metrics
-from cnn_model_builder import seresnet_v2
+from cnn_model_builder import seresnet_v2,build_cnn
 import matplotlib.pyplot as plt
 import time
 import datetime
 import subprocess
+from keras.regularizers import l2
+import pandas as pd
 #################################################
 #Use GPU as much as necessary(tensorflow only)
 from keras import backend as K
@@ -72,21 +74,22 @@ def createModel(base_model_path=None,emb_size=128,input_shape=(28,28,1)):
         print ("build and initalize model :{}".format("ResNet50"))
 #        base_model=keras.applications.resnet50.ResNet50(weights=None, 
 #                                                        include_top = False, 
-                                                      #input_tensor=Input(shape=input_shape))
+                                              #input_tensor=Input(shape=input_shape))
         n=2
         depth = n * 9 + 2
-        base_model=seresnet_v2(input_shape, depth, num_classes=10)
+        #base_model=seresnet_v2(input_shape, depth, num_classes=10)
+        base_model=build_cnn(input_shape,num_classes=2)
         x = base_model.layers[-2].output
     
     
-    embedded = Dense(emb_size)(x)
+    embedded = Dense(emb_size,kernel_regularizer=l2(1e-4))(x)
     # New Layers over ResNet50
 #    net = resnet_model.output
     #net = kl.Flatten(name='flatten')(net)
 #    net = kl.GlobalAveragePooling2D(name='gap')(net)
-#    #net = kl.Dropout(0.5)(net)
+    #x = Dropout(0.5)(x)
 #    net = kl.Dense(emb_size,activation='relu',name='t_emb_1')(net)
-#    net = kl.Lambda(lambda  x: K.l2_normalize(x,axis=1), name='t_emb_1_l2norm')(net)
+    #embedded = Lambda(lambda  x: K.l2_normalize(x,axis=1), name='t_emb_1_l2norm')(x)
 
     # model creation
     siamese_model = Model(base_model.input, embedded, name="base_model")
@@ -115,7 +118,7 @@ def createModel(base_model_path=None,emb_size=128,input_shape=(28,28,1)):
     # Variable Learning Rate per Layers
     #lr_mult_dict = {}
     if base_model_path is not None:
-        last_freeze_layer = model.layers[-8].name
+        last_freeze_layer = model.layers[-4].name
         for layer in model.layers:
             # comment this out to refine earlier layers
             if layer.name==last_freeze_layer:
@@ -165,33 +168,81 @@ def triplet_loss(y_true, y_pred):
     margin = K.constant(1)
     return K.mean(K.maximum(K.constant(0), K.square(y_pred[:,0,0]) - 0.5*(K.square(y_pred[:,1,0])+K.square(y_pred[:,2,0])) + margin))
 
+import Augmentor
+def get_Augmentor(path,batch_size,rotate=True,color=True,flip_ud=True):
+    p = Augmentor.Pipeline(path, output_directory="/tmp/")
+    p.skew_tilt(probability=0.5, magnitude=0.5)
+    p.random_distortion(probability=0.5, grid_width=4, grid_height=4, magnitude=2)
+    if rotate:
+        p.rotate90(probability=0.3)
+        p.rotate270(probability=0.3)
+        p.rotate(probability=0.3, max_left_rotation=10, max_right_rotation=10)
+    if flip_ud:
+        p.flip_top_bottom(probability=0.3)
+    p.flip_left_right(probability=0.3)
 
-def load_data(path):
-    files=os.listdir(os.path.join(path,"normal"))    
-    tmp=cv2.imread(os.path.join(path,"normal",files[0]))
-    height,width,color=tmp.shape
-    x_normal=np.zeros((len(files),height,width,color),dtype=np.float32)
-    for i,filename in enumerate(files):
-        img=cv2.imread(os.path.join(path,"normal",filename))
-        img=img[:,:,0]
-        x_normal[i,:,:,0]=img
-    x_normal/=255
-    files=os.listdir(os.path.join(path,"anomaly"))
-    x_anomaly=np.zeros((len(files),height,width,color),dtype=np.float32)
-    for i,filename in enumerate(files):
-        img=cv2.imread(os.path.join(path,"anomaly",filename))
-        img=img[:,:,0]
-        x_anomaly[i,:,:,0]=img
-    x_anomaly/=255
-    return x_normal,x_anomaly
+    if not color:
+        p.greyscale(probability=1.0)
+    g=p.keras_generator(batch_size=batch_size)
+    return g
+    
+def generator_from_Augmentor(normal_g,anomaly_g):
+    while True:
+        num_samples=10
+        for i in range(num_samples//batch_size):
+            x_anchors,_=next(normal_g)
+            x_positives,_=next(normal_g)
+            x_negatives,_=next(anomaly_g)
+            y=np.random.randint(2, size=(1,2,batch_size)).T#dummy
+            yield [x_anchors,x_positives,x_negatives],y
+            
+def load_data(path,color=False):
+    files=os.listdir(path)
+    if os.path.isdir(os.path.join(path,files[0])):
+        file_num=0 
+        for dirname in files:
+             imgs=os.listdir(os.path.join(path,dirname))
+             tmp=cv2.imread(os.path.join(path,dirname,imgs[0]))
+             #import pdb;pdb.set_trace()
+             height,width,_=tmp.shape
+             file_num+=len(imgs)
+        x_sample=np.zeros((file_num,height,width,3 if color else 1),dtype=np.float32)
+        file_count=0
+        for dirname in files:
+            imagenames=os.listdir(os.path.join(path,dirname))
+            for i,imagename in enumerate(imagenames):
+                img=cv2.imread(os.path.join(path,dirname,imagename))
+                if color:
+                    x_sample[file_count,:,:]=img
+                else:
+                    x_sample[file_count,:,:,0]=img[:,:,0]
+                file_count+=1
+        x_sample/=255
+        
+    else:
+        #single dir mode
+        imagenames=files
+        tmp=cv2.imread(os.path.join(path,imagenames[0]))
+        height,width,_=tmp.shape
+        x_sample=np.zeros((len(files),height,width,3 if color else 1),dtype=np.float32)
+        for i,filename in enumerate(files):
+            img=cv2.imread(os.path.join(path,filename))
+            if color:
+                x_sample[i,:,:]=img
+            else:
+                img=img[:,:,0]
+                x_sample[i,:,:,0]=img
+        x_sample/=255
+    return x_sample,imagenames
     
     
     
 
 def step_decay(epoch):
     x = 1e-3
-    if epoch >= 25: x /= 10.0
-    if epoch >= 45: x /= 10.0
+    if epoch >= 60: x /= 10.0
+    if epoch >= 100: x /= 10.0
+    if epoch >= 200: x /= 10.0
     return x
 
 
@@ -242,51 +293,113 @@ class BHTSNE(sklearn.base.BaseEstimator, sklearn.base.TransformerMixin):
 
 
 if __name__ == "__main__":
-    base_path="data/dog_vs_cat(all)"
+    base_path="data/tak/cond1_N_anomaly_10"
     train_path=os.path.join(base_path,"train")
     test_path=os.path.join(base_path,"test")
-    base_model_name="best_mnist_model_at_epoch-88-val_acc_0.995.h5"
-    batch_size=16
-    x_train_normal,x_train_anomaly=load_data(train_path)
-    x_test_normal,x_test_anomaly=load_data(test_path)
-    _,input_height,input_width,input_channels=x_train_normal.shape
-    
+    valid_path=os.path.join(base_path,"valid")
+    base_model_name="best_model_at_epoch-194-val_acc_0.817.h5"
+    batch_size=10
+    emb_size=128 
+    epochs=200
+    color=False
+    Use_Augmentor=True
+    Use_Pretrained_model=False
+    if Use_Augmentor:
+        normal_g=get_Augmentor(os.path.join(base_path,"train","normal"),batch_size=batch_size)
+        anomaly_g=get_Augmentor(os.path.join(base_path,"train","anomaly"),batch_size=batch_size)
+        trainGene=generator_from_Augmentor(normal_g,anomaly_g)
+        x_train_normal,tr_n_filenames=load_data(os.path.join(train_path,"normal"),color=color)
+        x_valid_normal,vl_n_filenames=load_data(os.path.join(valid_path,"normal"),color=color)
+        x_test_normal,ts_n_filenames=load_data(os.path.join(test_path,"normal"),color=color)
+        x_test_anomaly,ts_a_filenames=load_data(os.path.join(test_path,"anomaly"),color=color)
+        _,input_height,input_width,input_channels=x_test_normal.shape
+    else:
+        x_train_normal,tr_n_filenames=load_data(os.path.join(train_path,"normal"),color=color)
+        x_train_anomaly,tr_a_filenames=load_data(os.path.join(train_path,"anomaly"),color=color)
+        x_test_normal,ts_n_filenames=load_data(os.path.join(test_path,"normal"),color=color)
+        x_test_anomal,ts_a_filenames=load_data(os.path.join(test_path,"anomaly"),color=color)
+        _,input_height,input_width,input_channels=x_train_normal.shape
+        trainGene=train_pairs_generator(x_train_normal,x_train_anomaly,batch_size=batch_size)
 
-    model=createModel(base_model_path=None,input_shape=(input_height,input_width,input_channels))
+    test_num_normals=x_test_normal.shape[0]
+    test_num_anomalys=x_test_anomaly.shape[0]
+    normal_ratio= test_num_normals/(test_num_normals+test_num_anomalys)
+
+    model=createModel(base_model_path=base_model_name if Use_Pretrained_model else None,emb_size=emb_size,input_shape=(input_height,input_width,input_channels))
+    pred_model = model.get_layer('base_model')
     print("Done.")
-    trainGene=train_pairs_generator(x_train_normal,x_train_anomaly,batch_size=batch_size)
-    epochs=100
+
     
     scheduler = LearningRateScheduler(step_decay)
     checkpoint = ModelCheckpoint("best_model.h5", monitor="loss", save_best_only=True)
-    
-    best_model_name = "best_model_at_epoch-{epoch:02d}-acc_{acc:.3f}.h5"
+    callbacks=[scheduler,checkpoint]
+    num_samples=x_train_normal.shape[0]
+    best_f1=0
+    best_model_name = "best_model_f1_{}.h5".format(best_f1)
     best_model_path = os.path.join(outputdir, best_model_name)
+    hist_columns=["train_loss","train_accuracy","val_accuracy","val_precision","val_recall","val_f1_score"]
+    df_history=pd.DataFrame(columns=hist_columns)
     for e in range(epochs):
         print("epoch:{}/{}".format(e+1,epochs))
-        model.fit_generator(trainGene, 
-                            steps_per_epoch=len(x_train_normal//2) / batch_size, 
+        history=model.fit_generator(trainGene, 
+                            steps_per_epoch=num_samples//(2*batch_size), 
                             epochs=1, 
                             shuffle=True, 
                             use_multiprocessing=True,
-                            callbacks=[checkpoint])
-        model.predict
+                            #callbacks=[checkpoint]
+                            )
+        train_acc=history.history["accuracy"][0]
+        train_loss=history.history["loss"][0]
+        
+        print("evaluating...")
+        pred_normal=pred_model.predict(x_test_normal)
+        pred_anomaly=pred_model.predict(x_test_anomaly)
+        pred_anchors=pred_model.predict(x_valid_normal)
+        test_num_normals=pred_normal.shape[0]
+        test_num_anomalys=pred_anomaly.shape[0]
+        
+        preds=np.r_[pred_normal,pred_anomaly]
+        dist_matrix = np.zeros((preds.shape[0], pred_anchors.shape[0]), np.float32)
+        for i in range(dist_matrix.shape[0]):
+            dist_matrix[i,:] = euclidean_distances(preds[i,:].reshape(1,-1),
+                                               pred_anchors)[0]
+        min_dists = np.min(dist_matrix, axis=-1)
+        th=np.percentile(min_dists,normal_ratio*100)
+        y_pred=(min_dists>th).astype(np.uint8)
+        y_test=np.zeros(preds.shape[0])
+        y_test[test_num_normals:]=1#for calc auc normal=0,anomaly=1
+        acc=metrics.accuracy_score(y_test, y_pred)
+        prc=metrics.precision_score(y_test, y_pred)
+        rcl=metrics.recall_score(y_test, y_pred)
+        f1=metrics.f1_score(y_test, y_pred)
+        
+        series_temp=pd.Series([train_loss,train_acc,acc,prc,rcl,f1],index=hist_columns)
+        df_history=df_history.append(series_temp,ignore_index=True)
+        
+        print("val_accuacy : {:.3} , val_precision : {:.3} , val_recall : {:.3} , val_f : {:.3}".format(acc,prc,rcl,f1))
+        if f1>best_f1:
+            print("f1 improved from {:.3}".format(f1))
+            best_f1=f1
+        model.save(os.path.join(outputdir,"last_model.h5".format(best_f1)))
     try:
-        model=load_model(best_model_path)
+        #print("Loadding best f1 model:{}".format(base_model))
+        model=load_model("best_model_f1_{}.h5".format(best_f1),custom_objects={'triplet_loss':triplet_loss })
     except:
         print("failed to load_best_model.use last weights")
     #%%
-    pred_model = model.get_layer('base_model')
+    plt.figure()
+    df_history.plot(legend=True)
+    plt.savefig(os.path.join(outputdir,"history.png"))
+    
     pred_normal=pred_model.predict(x_test_normal,verbose=1)
     pred_anomaly=pred_model.predict(x_test_anomaly,verbose=1)
-    test_num_normals=pred_normal.shape[0]
-    test_num_anomalys=pred_anomaly.shape[0]
+
 
     preds=np.r_[pred_normal,pred_anomaly]    
     y_test=np.zeros(preds.shape[0])
     y_test[test_num_normals:]=1#for calc auc normal=0,anomaly=1
     
-    pred_anchors=pred_model.predict(x_train_normal)
+    pred_anchors=pred_model.predict(x_valid_normal)
     
     dist_matrix = np.zeros((preds.shape[0], pred_anchors.shape[0]), np.float32)
     for i in range(dist_matrix.shape[0]):
@@ -295,8 +408,9 @@ if __name__ == "__main__":
     min_dists = np.min(dist_matrix, axis=-1)
     plt.figure()
     plt.title("histgram normal vs anomaly")
-    plt.hist(min_dists[:pred_normal.shape[0]],color="b",bins=100,alpha=0.8)
-    plt.hist(min_dists[pred_normal.shape[0]:],color="r",bins=100,alpha=0.8)
+    plt.hist(min_dists[:pred_normal.shape[0]],color="b",bins=100,alpha=0.8,label="normal")
+    plt.hist(min_dists[pred_normal.shape[0]:],color="r",bins=100,alpha=0.8,label="anomaly")
+    plt.legend()
     plt.savefig(os.path.join(outputdir,"histgram.png"))
     
     auc=roc_auc_score(y_test, min_dists)
@@ -312,7 +426,6 @@ if __name__ == "__main__":
     plt.xlabel('False Positive Rate')
     plt.ylabel('True Positive Rate')
     plt.grid(True)
-    plt.show()
     plt.savefig(os.path.join(outputdir,"ROC curve.png"))
     
     #T-SNE
@@ -328,3 +441,6 @@ if __name__ == "__main__":
     plt.scatter(x_embeded[test_num_normals:,0],x_embeded[test_num_normals:,1],label="anomaly",c="r",alpha=0.5)
     plt.legend()
     plt.savefig(os.path.join(outputdir,"tsne.png"))
+    
+    df=pd.DataFrame(min_dists,)
+    
